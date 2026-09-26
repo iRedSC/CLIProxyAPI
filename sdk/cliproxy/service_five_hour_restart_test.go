@@ -53,7 +53,7 @@ func TestFiveHourRestartRequestUsesPinnedCredentialAndTinyPayload(t *testing.T) 
 			if gjson.GetBytes(request.Payload, "model").String() != tc.model {
 				t.Fatalf("request model = %s", request.Payload)
 			}
-			if tc.provider == "claude" && (gjson.GetBytes(request.Payload, "max_tokens").Int() != 1 || gjson.GetBytes(request.Payload, "messages.0.content").String() != "Hi") {
+			if tc.provider == "claude" && (gjson.GetBytes(request.Payload, "max_tokens").Int() != 8 || gjson.GetBytes(request.Payload, "messages.0.content").String() != "Reply OK.") {
 				t.Fatalf("Claude request is not minimal generation: %s", request.Payload)
 			}
 			if tc.provider == "codex" && gjson.GetBytes(request.Payload, "input").String() == "" {
@@ -92,11 +92,14 @@ func TestFiveHourResetUsesOnlyFiveHourWindow(t *testing.T) {
 	auth.Quota.Signals = map[string]string{
 		"Anthropic-Ratelimit-Unified-5h-Reset":  "100060",
 		"Anthropic-Ratelimit-Unified-7d-Status": "rejected",
+		"Anthropic-Ratelimit-Unified-7d-Reset":  "100120",
 	}
-	if _, ok := fiveHourResetAt(auth); ok {
-		t.Fatal("weekly quota rejection must suppress restart")
+	if !claudeWeeklyWindowBlocked(auth, observed.Add(time.Minute)) {
+		t.Fatal("active weekly rejection must suppress restart")
 	}
-	delete(auth.Quota.Signals, "Anthropic-Ratelimit-Unified-7d-Status")
+	if claudeWeeklyWindowBlocked(auth, observed.Add(3*time.Minute)) {
+		t.Fatal("expired weekly rejection must allow restart")
+	}
 	if reset, ok := fiveHourResetAt(auth); !ok || !reset.Equal(observed.Add(time.Minute)) {
 		t.Fatalf("Claude reset = %v, %v", reset, ok)
 	}
@@ -125,9 +128,9 @@ func TestFiveHourRestartSendsOnceForObservedReset(t *testing.T) {
 		t.Fatalf("register auth: %v", err)
 	}
 	s := &Service{cfg: &config.Config{RestartFiveHourWindow: true}, coreManager: manager}
-	attempted := make(map[string]time.Time)
+	tracker := &fiveHourRestartTracker{attempts: make(map[string]fiveHourRestartAttempt)}
 	concurrent := make(chan struct{}, 1)
-	s.restartDueFiveHourWindows(context.Background(), now, attempted, concurrent)
+	s.restartDueFiveHourWindows(context.Background(), now, tracker, concurrent)
 	select {
 	case got := <-executor.calls:
 		if got != authID+":"+model {
@@ -136,8 +139,73 @@ func TestFiveHourRestartSendsOnceForObservedReset(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("restart request was not sent")
 	}
-	s.restartDueFiveHourWindows(context.Background(), now.Add(time.Minute), attempted, concurrent)
+	s.restartDueFiveHourWindows(context.Background(), now.Add(time.Minute), tracker, concurrent)
 	if len(executor.calls) != 0 {
 		t.Fatal("same window was restarted twice")
+	}
+}
+
+func TestFiveHourRestartBootstrapsCredentialsWithoutQuotaSignals(t *testing.T) {
+	for _, tc := range []struct {
+		provider string
+		model    string
+	}{
+		{provider: "codex", model: "gpt-5.6-luna"},
+		{provider: "claude", model: "claude-haiku-4-5-20251001"},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			authID := "bootstrap-" + tc.provider
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(authID, tc.provider, []*registry.ModelInfo{{ID: tc.model}})
+			t.Cleanup(func() { reg.UnregisterClient(authID) })
+
+			manager := coreauth.NewManager(nil, nil, nil)
+			executor := &fiveHourRestartExecutor{provider: tc.provider, calls: make(chan string, 2)}
+			manager.RegisterExecutor(executor)
+			if _, err := manager.Register(context.Background(), &coreauth.Auth{
+				ID: authID, Provider: tc.provider, Status: coreauth.StatusActive,
+			}); err != nil {
+				t.Fatalf("register auth: %v", err)
+			}
+			s := &Service{cfg: &config.Config{RestartFiveHourWindow: true}, coreManager: manager}
+			tracker := &fiveHourRestartTracker{attempts: make(map[string]fiveHourRestartAttempt)}
+			concurrent := make(chan struct{}, 1)
+			now := time.Now()
+			s.restartDueFiveHourWindows(context.Background(), now, tracker, concurrent)
+			select {
+			case got := <-executor.calls:
+				if got != authID+":"+tc.model {
+					t.Fatalf("executed %q", got)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("startup request was not sent")
+			}
+			s.restartDueFiveHourWindows(context.Background(), now.Add(time.Minute), tracker, concurrent)
+			if len(executor.calls) != 0 {
+				t.Fatal("startup request was repeated before the next window")
+			}
+		})
+	}
+}
+
+func TestFiveHourRestartTrackerRetriesFailureAndUsesFallback(t *testing.T) {
+	tracker := &fiveHourRestartTracker{attempts: make(map[string]fiveHourRestartAttempt)}
+	now := time.Unix(100000, 0)
+	if !tracker.start("auth", now, time.Time{}, false) {
+		t.Fatal("unobserved credential was not scheduled")
+	}
+	tracker.finish("auth", time.Time{}, now, false)
+	if tracker.start("auth", now.Add(time.Minute), time.Time{}, false) {
+		t.Fatal("failed request retried immediately")
+	}
+	if !tracker.start("auth", now.Add(fiveHourRestartRetryInterval), time.Time{}, false) {
+		t.Fatal("failed request was not retried")
+	}
+	tracker.finish("auth", time.Time{}, now.Add(fiveHourRestartRetryInterval), true)
+	if tracker.start("auth", now.Add(time.Hour), time.Time{}, false) {
+		t.Fatal("successful request repeated before five hours")
+	}
+	if !tracker.start("auth", now.Add(fiveHourRestartRetryInterval+5*time.Hour), time.Time{}, false) {
+		t.Fatal("five-hour fallback did not run")
 	}
 }

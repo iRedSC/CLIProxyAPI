@@ -43,7 +43,7 @@ remote-management:
 # Authentication directory (supports ~ for home directory)
 auth-dir: "~/.cli-proxy-api"
 
-# Send one small Codex or Claude request after an observed 5-hour window resets.
+# Send a small Codex or Claude request at startup and after each 5-hour reset.
 # Requests use the same credential and count toward provider usage. Default: true.
 restart-five-hour-window: true
 

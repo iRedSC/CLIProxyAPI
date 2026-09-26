@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -15,20 +16,68 @@ import (
 )
 
 const fiveHourRestartPollInterval = 30 * time.Second
+const fiveHourRestartRetryInterval = 5 * time.Minute
 
-// runFiveHourWindowRestart observes the last generation response for each credential.
-// An attempted reset is kept in memory, so failures or responses without quota
-// headers cannot cause repeated requests for the same window.
+type fiveHourRestartAttempt struct {
+	inFlight     bool
+	lastReset    time.Time
+	nextFallback time.Time
+	retryAfter   time.Time
+}
+
+type fiveHourRestartTracker struct {
+	mu       sync.Mutex
+	attempts map[string]fiveHourRestartAttempt
+}
+
+func (t *fiveHourRestartTracker) start(authID string, now, resetAt time.Time, hasReset bool) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	state := t.attempts[authID]
+	if state.inFlight || now.Before(state.retryAfter) {
+		return false
+	}
+	if hasReset && resetAt.After(state.lastReset) {
+		if now.Before(resetAt.Add(5 * time.Second)) {
+			return false
+		}
+	} else if !state.nextFallback.IsZero() && now.Before(state.nextFallback) {
+		return false
+	}
+	state.inFlight = true
+	t.attempts[authID] = state
+	return true
+}
+
+func (t *fiveHourRestartTracker) finish(authID string, resetAt, finishedAt time.Time, success bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	state := t.attempts[authID]
+	state.inFlight = false
+	if success {
+		if resetAt.After(state.lastReset) {
+			state.lastReset = resetAt
+		}
+		state.nextFallback = finishedAt.Add(5 * time.Hour)
+		state.retryAfter = time.Time{}
+	} else {
+		state.retryAfter = finishedAt.Add(fiveHourRestartRetryInterval)
+	}
+	t.attempts[authID] = state
+}
+
+// runFiveHourWindowRestart starts a window for credentials without an observed
+// reset, then follows provider reset signals or a five-hour fallback schedule.
 func (s *Service) runFiveHourWindowRestart(ctx context.Context) {
 	if s == nil || s.coreManager == nil {
 		return
 	}
 	ticker := time.NewTicker(fiveHourRestartPollInterval)
 	defer ticker.Stop()
-	lastAttempt := make(map[string]time.Time)
+	tracker := &fiveHourRestartTracker{attempts: make(map[string]fiveHourRestartAttempt)}
 	concurrent := make(chan struct{}, 4)
 	for {
-		s.restartDueFiveHourWindows(ctx, time.Now(), lastAttempt, concurrent)
+		s.restartDueFiveHourWindows(ctx, time.Now(), tracker, concurrent)
 		select {
 		case <-ctx.Done():
 			return
@@ -37,7 +86,7 @@ func (s *Service) runFiveHourWindowRestart(ctx context.Context) {
 	}
 }
 
-func (s *Service) restartDueFiveHourWindows(ctx context.Context, now time.Time, lastAttempt map[string]time.Time, concurrent chan struct{}) {
+func (s *Service) restartDueFiveHourWindows(ctx context.Context, now time.Time, tracker *fiveHourRestartTracker, concurrent chan struct{}) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -48,8 +97,12 @@ func (s *Service) restartDueFiveHourWindows(ctx context.Context, now time.Time, 
 		return
 	}
 	for _, auth := range s.coreManager.List() {
+		if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled ||
+			(auth.Provider != "codex" && auth.Provider != "claude") || claudeWeeklyWindowBlocked(auth, now) {
+			continue
+		}
 		resetAt, ok := fiveHourResetAt(auth)
-		if !ok || now.Before(resetAt.Add(5*time.Second)) || !resetAt.After(lastAttempt[auth.ID]) {
+		if now.Before(auth.NextRetryAfter) || (auth.Quota.Exceeded && now.Before(auth.Quota.NextRecoverAt)) {
 			continue
 		}
 		model := fiveHourRestartModel(auth)
@@ -58,14 +111,21 @@ func (s *Service) restartDueFiveHourWindows(ctx context.Context, now time.Time, 
 		}
 		select {
 		case concurrent <- struct{}{}:
-			lastAttempt[auth.ID] = resetAt
-			go func(authID, provider, model string) {
+			if !tracker.start(auth.ID, now, resetAt, ok) {
+				<-concurrent
+				continue
+			}
+			go func(authID, provider, model string, resetAt time.Time) {
 				defer func() { <-concurrent }()
 				request, options := fiveHourRestartRequest(provider, model, authID)
-				if _, err := s.coreManager.Execute(ctx, []string{provider}, request, options); err != nil && ctx.Err() == nil {
+				_, err := s.coreManager.Execute(ctx, []string{provider}, request, options)
+				tracker.finish(authID, resetAt, time.Now(), err == nil)
+				if err != nil && ctx.Err() == nil {
 					log.WithError(err).WithFields(log.Fields{"provider": provider, "auth_id": authID}).Warn("five-hour window restart request failed")
+				} else if err == nil {
+					log.WithFields(log.Fields{"provider": provider, "auth_id": authID}).Info("five-hour window restart request succeeded")
 				}
-			}(auth.ID, auth.Provider, model)
+			}(auth.ID, auth.Provider, model, resetAt)
 		default:
 			return
 		}
@@ -79,18 +139,14 @@ func fiveHourResetAt(auth *coreauth.Auth) (time.Time, bool) {
 	signals := auth.Quota.Signals
 	switch auth.Provider {
 	case "claude":
-		if strings.EqualFold(signals["Anthropic-Ratelimit-Unified-7d-Status"], "rejected") ||
-			strings.EqualFold(signals["Anthropic-Ratelimit-Unified-7d_oi-Status"], "rejected") {
-			return time.Time{}, false
-		}
-		return parseFiveHourResetUnix(signals["Anthropic-Ratelimit-Unified-5h-Reset"], auth.Quota.ObservedAt)
+		return parseQuotaResetUnix(signals["Anthropic-Ratelimit-Unified-5h-Reset"], auth.Quota.ObservedAt)
 	case "codex":
 		for _, window := range []string{"Primary", "Secondary"} {
 			prefix := "X-Codex-" + window + "-"
 			if signals[prefix+"Window-Minutes"] != "300" {
 				continue
 			}
-			if reset, ok := parseFiveHourResetUnix(signals[prefix+"Reset-At"], auth.Quota.ObservedAt); ok {
+			if reset, ok := parseQuotaResetUnix(signals[prefix+"Reset-At"], auth.Quota.ObservedAt); ok {
 				return reset, true
 			}
 			seconds, err := strconv.ParseInt(signals[prefix+"Reset-After-Seconds"], 10, 64)
@@ -102,7 +158,19 @@ func fiveHourResetAt(auth *coreauth.Auth) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func parseFiveHourResetUnix(raw string, observedAt time.Time) (time.Time, bool) {
+func claudeWeeklyWindowBlocked(auth *coreauth.Auth, now time.Time) bool {
+	if auth == nil || auth.Provider != "claude" {
+		return false
+	}
+	signals := auth.Quota.Signals
+	if !strings.EqualFold(signals["Anthropic-Ratelimit-Unified-7d-Status"], "rejected") {
+		return false
+	}
+	reset, ok := parseQuotaResetUnix(signals["Anthropic-Ratelimit-Unified-7d-Reset"], auth.Quota.ObservedAt)
+	return ok && now.Before(reset)
+}
+
+func parseQuotaResetUnix(raw string, observedAt time.Time) (time.Time, bool) {
 	seconds, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || seconds <= 0 {
 		return time.Time{}, false
@@ -139,8 +207,8 @@ func fiveHourRestartRequest(provider, model, authID string) (cliproxyexecutor.Re
 	if provider == "claude" {
 		format = sdktranslator.FormatClaude
 		body = map[string]any{
-			"model": model, "max_tokens": 1,
-			"messages": []map[string]string{{"role": "user", "content": "Hi"}},
+			"model": model, "max_tokens": 8,
+			"messages": []map[string]string{{"role": "user", "content": "Reply OK."}},
 		}
 	}
 	payload, _ := json.Marshal(body)
