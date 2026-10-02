@@ -7,11 +7,11 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -42,8 +42,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		reporter.SetUpstreamModel(upstreamModel)
 	}
 	from := opts.SourceFormat
-	ctx = withClaudeInboundFormat(ctx, from.String())
-	ctx = withClaudeDirectMessagesPassthrough(ctx, from == sdktranslator.FormatClaude && isAnthropicUpstreamBase(baseURL))
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("claude")
 	var replayScope claudeThinkingReplayScope
@@ -92,7 +90,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
-	wirePolicy, wireSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode)
+	_, wireSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode)
 	bodyBeforeCloaking := body
 	isProbeOrHelper := helps.IsClaudeProbeOrHelperRequest(bodyBeforeCloaking)
 	var cloaked bool
@@ -208,23 +206,20 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = normalizeClaudeSamplingForUpstream(body, confirmedClaudeCode)
 
 	// Default cache_control for translated entrypoints (Responses/Chat/Gemini) and other
-	// non-native callers. Confirmed native Claude Code and direct Messages callers own
-	// their marker placement and must not be rewritten. Cloaked requests always run
-	// section-independent ensure so cloaking's first-user marker cannot suppress
-	// system/latest-user breakpoints.
-	messagesPassthrough := !confirmedClaudeCode && claudeInboundMessagesPassthrough(ctx) && wirePolicy.OAuth && !wirePolicy.CloakConfigured
-	cpaOwnsCacheControl := !messagesPassthrough && shouldEnsureCacheControl(body, cloaked, confirmedClaudeCode)
+	// non-native callers. Confirmed native Claude Code owns its marker placement and must
+	// not be rewritten. Cloaked requests always run section-independent ensure so cloaking's
+	// first-user marker cannot suppress system/latest-user breakpoints.
+	// cloaked and confirmedClaudeCode are mutually exclusive: resolveClaudeWirePolicy
+	// forces Cloak off for a confirmed native client.
+	cpaOwnsCacheControl := shouldEnsureCacheControl(body, cloaked, confirmedClaudeCode)
 	if cpaOwnsCacheControl {
 		body = ensureCacheControl(body)
 	}
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	// Cloaking and ensureCacheControl may push the total over 4 when the client
-	// already sends multiple cache_control blocks. Direct Messages callers retain
-	// their caller-owned cache layout.
-	if !messagesPassthrough {
-		body = enforceCacheControlLimit(body, 4)
-	}
+	// already sends multiple cache_control blocks.
+	body = enforceCacheControlLimit(body, 4)
 
 	// Native selects the 1h cache pool only for OAuth credentials and pairs it with
 	// extended-cache-ttl-2025-04-11, which claudeCodeCLIBetas emits on exactly the
@@ -241,17 +236,15 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// probes omit both 1h cache and extended-cache-ttl.
 	isSubagent := helps.IsClaudeSubagentRequest(incomingHeaders, body)
 	subagent1h := isSubagent && helps.ClaudeSubagentRequests1h(incomingHeaders, body)
-	if !messagesPassthrough {
-		if cpaOwnsCacheControl && fp.ProfileClaudeCodeCLI && (!isSubagent || subagent1h) && !isProbeOrHelper {
-			body = upgradeClaudeCacheControlTTL(body, claudeCacheControlTTL1h)
-		} else if isProbeOrHelper || (isSubagent && !subagent1h) {
-			body = stripClaudeCacheControlTTL(body)
-		}
-
-		// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-		// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
-		body = normalizeCacheControlTTL(body)
+	if cpaOwnsCacheControl && fp.ProfileClaudeCodeCLI && (!isSubagent || subagent1h) && !isProbeOrHelper {
+		body = upgradeClaudeCacheControlTTL(body, claudeCacheControlTTL1h)
+	} else if isProbeOrHelper || (isSubagent && !subagent1h) {
+		body = stripClaudeCacheControlTTL(body)
 	}
+
+	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
+	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
+	body = normalizeCacheControlTTL(body)
 	// Payload rules and other request processing may rewrite stream. Keep the
 	// upstream body, transport headers, and response parser on one authority.
 	// Native non-stream Haiku helper requests omit stream rather than sending
@@ -284,7 +277,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	cchBilling := ""
 	if cchSigning {
-		if !messagesPassthrough && (!claudeCodeDetection.HelperProfile || claudeBodyNeedsBillingFallback(bodyForUpstream)) {
+		if !claudeCodeDetection.HelperProfile || claudeBodyNeedsBillingFallback(bodyForUpstream) {
 			cchBilling = claudeCCHFallbackBillingHeader(ctx, e.cfg, bodyForUpstream, claudeCodeDetection.Entrypoint)
 		}
 		bodyForUpstream, err = finalizeAnthropicMessagesBodyCCH(bodyForUpstream, cchBilling)
@@ -392,6 +385,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, err)
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	var streamUsage helps.StreamUsageBuffer
 	if upstreamStream {
 		if errValidate := validateClaudeStreamingResponse(data); errValidate != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errValidate)
@@ -401,7 +395,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			commitClaudeContinuity(diagnosticsState, msgID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
 		}
 		lines := bytes.Split(data, []byte("\n"))
-		var streamUsage helps.StreamUsageBuffer
 		for i, line := range lines {
 			reporter.ObserveResponseModel(line)
 			streamUsage.ObserveClaudeStream(line)
@@ -414,12 +407,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			}
 			lines[i] = restoredLine
 		}
-		streamUsage.Publish(ctx, reporter)
 		data = bytes.Join(lines, []byte("\n"))
 	} else {
 		commitClaudeContinuity(diagnosticsState, claudeMessageIDFromResponse(data), helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
 		reporter.ObserveResponseModel(data)
-		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
 		var errRestore error
 		data, errRestore = restoreClaudeOAuthToolNamesFromResponse(data, oauthToolNamesReverseMap)
 		if errRestore != nil {
@@ -436,11 +427,19 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		to,
 		responseFormat,
 		req.Model,
-		opts.OriginalRequest,
+		helps.ApplyPatchOriginalRequest(req, opts),
 		bodyForTranslation,
 		data,
 		&param,
 	)
+	if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
+		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+	}
+	if upstreamStream {
+		streamUsage.Publish(ctx, reporter)
+	} else {
+		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
+	}
 	if responseFormat == sdktranslator.FormatOpenAIResponse {
 		out = helps.EnsureResponsesUsageDetails(out)
 	}
