@@ -854,6 +854,10 @@ oauth:
   # Authentication directory (supports ~ for home directory)
   auth-dir: "~/.cli-proxy-api"
 
+  # Send a small Codex or Claude request at startup and after each 5-hour reset.
+  # Requests use the same credential and count toward provider usage. Default: true.
+  restart-five-hour-window: true
+
   # Core auth auto-refresh and manual refresh-all worker pool size (OAuth/file-based auth token refresh).
   # When > 0, overrides the default worker count (16).
   # auth-auto-refresh-workers: 16
