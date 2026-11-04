@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
-	"github.com/tidwall/gjson"
 )
 
 type fiveHourRestartExecutor struct {
@@ -50,13 +50,13 @@ func TestFiveHourRestartRequestUsesPinnedCredentialAndTinyPayload(t *testing.T) 
 			if options.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] != "target-auth" || request.Model != tc.model {
 				t.Fatalf("request is not pinned to target credential: %+v %+v", request, options)
 			}
-			if gjson.GetBytes(request.Payload, "model").String() != tc.model {
+			if ojson.GetBytes(request.Payload, "model").String() != tc.model {
 				t.Fatalf("request model = %s", request.Payload)
 			}
-			if tc.provider == "claude" && (gjson.GetBytes(request.Payload, "max_tokens").Int() != 8 || gjson.GetBytes(request.Payload, "messages.0.content").String() != "Reply OK.") {
+			if tc.provider == "claude" && (ojson.GetBytes(request.Payload, "max_tokens").Int() != 8 || ojson.GetBytes(request.Payload, "messages.0.content").String() != "Reply OK.") {
 				t.Fatalf("Claude request is not minimal generation: %s", request.Payload)
 			}
-			if tc.provider == "codex" && gjson.GetBytes(request.Payload, "input").String() == "" {
+			if tc.provider == "codex" && ojson.GetBytes(request.Payload, "input").String() == "" {
 				t.Fatalf("Codex request has no input: %s", request.Payload)
 			}
 		})

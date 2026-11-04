@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
 )
 
 // Upstream prompt caches expire after a period without reads. In cache-aware
@@ -73,26 +73,26 @@ func requestHasClaude1hCacheControl(body []byte) bool {
 		return false
 	}
 	found := false
-	visit := func(block gjson.Result) bool {
+	visit := func(block ojson.Result) bool {
 		if block.Get("cache_control.ttl").String() == "1h" {
 			found = true
 			return false
 		}
 		return true
 	}
-	if tools := gjson.GetBytes(body, "tools"); tools.IsArray() {
-		tools.ForEach(func(_, tool gjson.Result) bool { return visit(tool) })
+	if tools := ojson.GetBytes(body, "tools"); tools.IsArray() {
+		tools.ForEach(func(_, tool ojson.Result) bool { return visit(tool) })
 	}
-	if system := gjson.GetBytes(body, "system"); !found && system.IsArray() {
-		system.ForEach(func(_, block gjson.Result) bool { return visit(block) })
+	if system := ojson.GetBytes(body, "system"); !found && system.IsArray() {
+		system.ForEach(func(_, block ojson.Result) bool { return visit(block) })
 	}
-	if messages := gjson.GetBytes(body, "messages"); !found && messages.IsArray() {
-		messages.ForEach(func(_, message gjson.Result) bool {
+	if messages := ojson.GetBytes(body, "messages"); !found && messages.IsArray() {
+		messages.ForEach(func(_, message ojson.Result) bool {
 			if !visit(message) {
 				return false
 			}
 			if content := message.Get("content"); content.IsArray() {
-				content.ForEach(func(_, block gjson.Result) bool { return visit(block) })
+				content.ForEach(func(_, block ojson.Result) bool { return visit(block) })
 			}
 			return !found
 		})
