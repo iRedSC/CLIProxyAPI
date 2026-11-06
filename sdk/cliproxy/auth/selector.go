@@ -934,6 +934,7 @@ type SessionAffinitySelector struct {
 	matcher           *cliproxysession.MerklePrefixMatcher
 	subagentAffinity  bool
 	rebindOnQuotaOnly bool
+	cacheAwareTTL     bool
 }
 
 const (
@@ -1069,6 +1070,12 @@ type SessionAffinityConfig struct {
 	TTL              time.Duration
 	SubagentAffinity *bool
 	RebindOn         string
+	// CacheAwareTTL replaces the fixed TTL for explicit session bindings with the
+	// estimated upstream prompt cache lifetime of each request (see
+	// estimatePromptCacheTTL), so a session is released for rebalancing once its
+	// cache has expired. TTL is ignored; the content-prefix (LCP) matcher, which
+	// cannot vary TTL per entry, retains bindings for the longest estimate.
+	CacheAwareTTL bool
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -1087,6 +1094,9 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
+	if cfg.CacheAwareTTL {
+		cfg.TTL = maxPromptCacheBindingTTL
+	}
 	subagentAffinity := true
 	if cfg.SubagentAffinity != nil {
 		subagentAffinity = *cfg.SubagentAffinity
@@ -1098,7 +1108,17 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		matcher:           cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
 		subagentAffinity:  subagentAffinity,
 		rebindOnQuotaOnly: rebindOnQuotaOnly,
+		cacheAwareTTL:     cfg.CacheAwareTTL,
 	}
+}
+
+// bindingTTL returns the TTL for an explicit session binding refreshed by this
+// request. Zero selects the cache's fixed TTL.
+func (s *SessionAffinitySelector) bindingTTL(provider string, opts cliproxyexecutor.Options) time.Duration {
+	if !s.cacheAwareTTL {
+		return 0
+	}
+	return estimatePromptCacheTTL(provider, opts.Headers, opts.OriginalRequest)
 }
 
 // Trees returns a backward-compatible in-memory session tree store.
@@ -1198,13 +1218,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
 	}
+	ttl := s.bindingTTL(provider, opts)
 	bind := func(authID string, recordSelection bool) {
 		keys := []string{cacheKey}
 		if fallbackKey != "" && !isSubagent && !isFork {
 			keys = append(keys, fallbackKey)
 		}
 		if !recordSelection {
-			s.cache.SetAliases(authID, keys...)
+			s.cache.SetAliasesTTL(ttl, authID, keys...)
 			return
 		}
 		bindingProvider := canonicalSchedulingProvider(provider)
@@ -1216,10 +1237,10 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				break
 			}
 		}
-		s.cache.setSessionAliases(authID, bindingProvider, primaryID, keys...)
+		s.cache.setAliases(ttl, authID, sessionBinding{sessionID: primaryID, provider: bindingProvider}, keys...)
 	}
 
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
+	if cachedAuthID, ok := s.cache.GetAndRefreshTTL(cacheKey, ttl); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
 				bind(auth.ID, true)
@@ -1775,9 +1796,10 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
 	}
 	if res.Success {
-		s.cache.Touch(cacheKey, res.AuthID)
+		ttl := s.bindingTTL(res.Provider, res.Options)
+		s.cache.TouchTTL(cacheKey, res.AuthID, ttl)
 		if fallbackKey != "" {
-			s.cache.Touch(fallbackKey, res.AuthID)
+			s.cache.TouchTTL(fallbackKey, res.AuthID, ttl)
 		}
 		return
 	}
