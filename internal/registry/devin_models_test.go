@@ -4,9 +4,42 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestValidateDevinModelsJSONAggregatesLightning(t *testing.T) {
+	data := []byte(`{
+		"devin": [
+			{"id": "swe-2-medium-lightning", "display_name": "SWE-2 Medium Lightning", "owned_by": "cognition"},
+			{"id": "swe-2-high-lightning", "display_name": "SWE-2 High Lightning", "owned_by": "cognition"},
+			{"id": "swe-2-max-lightning", "display_name": "SWE-2 Max Lightning", "owned_by": "cognition"}
+		]
+	}`)
+	models, err := ValidateDevinModelsJSON(data)
+	if err != nil {
+		t.Fatalf("expected valid, got error: %v", err)
+	}
+	if len(models) != 1 {
+		t.Fatalf("expected 3 lightning UIDs to aggregate into 1 model, got %d: %+v", len(models), models)
+	}
+	m := models[0]
+	if m.ID != "devin/swe-2-lightning" {
+		t.Errorf("aggregated ID = %q, want devin/swe-2-lightning", m.ID)
+	}
+	if m.DisplayName != "SWE-2 Lightning" {
+		t.Errorf("aggregated DisplayName = %q, want SWE-2 Lightning", m.DisplayName)
+	}
+	if m.Thinking == nil {
+		t.Fatal("expected Thinking levels on aggregated lightning model")
+	}
+	wantLevels := []string{"medium", "high", "max"}
+	if !reflect.DeepEqual(m.Thinking.Levels, wantLevels) {
+		t.Errorf("Thinking.Levels = %v, want %v", m.Thinking.Levels, wantLevels)
+	}
+}
 
 func TestValidateDevinModelsJSON(t *testing.T) {
 	t.Run("valid envelope devin", func(t *testing.T) {
@@ -125,11 +158,12 @@ func TestEmbeddedDevinModelsLoadedOnStartup(t *testing.T) {
 
 	expectedIDs := []string{
 		"devin/swe-2",
+		"devin/swe-2-lightning",
 		"devin/swe-1-6-slow",
 		"devin/glm-5-2",
 		"devin/glm-5-3",
 		"devin/deepseek-v4-flash",
-		"devin/deepseek-v4-1-flash",
+		"devin/deepseek-v4-1-flash-1017",
 		"devin/gemini-3-8-flash",
 		"devin/grok-4-6",
 		"devin/claude-fable-5-1",
@@ -349,5 +383,70 @@ func TestWithDevinBuiltins(t *testing.T) {
 	}
 	if replaced[0].DisplayName != "SWE-1.6 Slow" {
 		t.Errorf("expected DisplayName 'SWE-1.6 Slow', got %q", replaced[0].DisplayName)
+	}
+}
+
+func TestEmbeddedDevinModels_NoThinkingSuffixes_Issue6141(t *testing.T) {
+	models := GetDevinModels()
+	disallowedSuffixes := []string{
+		"-low-fast", "-medium-fast", "-high-fast", "-xhigh-fast", "-max-fast",
+		"-none-fast", "-minimal-lightning", "-low-lightning", "-medium-lightning",
+		"-high-lightning", "-xhigh-lightning", "-max-lightning", "-none-lightning",
+		"-low", "-medium", "-high", "-xhigh", "-max", "-none",
+		"-thinking-1m", "-thinking", "_none", "_minimal", "_low", "_medium",
+		"_high", "_xhigh", "_max", "_thinking",
+	}
+	var exposedThinkingVariants []string
+	for _, m := range models {
+		cleanID := strings.TrimPrefix(m.ID, "devin/")
+		for _, s := range disallowedSuffixes {
+			if strings.HasSuffix(cleanID, s) {
+				exposedThinkingVariants = append(exposedThinkingVariants, m.ID)
+				break
+			}
+		}
+	}
+	if len(exposedThinkingVariants) > 0 {
+		t.Fatalf("Devin catalog exposes thinking-parameter model variants (count=%d): %v", len(exposedThinkingVariants), exposedThinkingVariants)
+	}
+}
+
+func TestValidateDevinModelsJSON_AggregatesThinkingVariants_Issue6141(t *testing.T) {
+	payload := []byte(`{
+		"devin": [
+			{
+				"id": "claude-opus-5",
+				"display_name": "Claude Opus 5",
+				"owned_by": "anthropic",
+				"thinking": {"levels": ["medium"]}
+			},
+			{
+				"id": "claude-opus-5-low-fast",
+				"display_name": "Claude Opus 5 Low Fast",
+				"owned_by": "anthropic"
+			},
+			{
+				"id": "claude-opus-5-high-fast",
+				"display_name": "Claude Opus 5 High Fast",
+				"owned_by": "anthropic"
+			}
+		]
+	}`)
+	models, err := ValidateDevinModelsJSON(payload)
+	if err != nil {
+		t.Fatalf("ValidateDevinModelsJSON failed: %v", err)
+	}
+	if len(models) != 1 {
+		t.Fatalf("expected 1 aggregated model, got %d: %+v", len(models), models)
+	}
+	if models[0].ID != "devin/claude-opus-5" {
+		t.Errorf("expected ID devin/claude-opus-5, got %q", models[0].ID)
+	}
+	if models[0].Thinking == nil {
+		t.Fatalf("expected Thinking to be populated")
+	}
+	expectedLevels := []string{"low", "medium", "high"}
+	if !reflect.DeepEqual(models[0].Thinking.Levels, expectedLevels) {
+		t.Fatalf("expected thinking levels %v, got %v", expectedLevels, models[0].Thinking.Levels)
 	}
 }

@@ -8,13 +8,13 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -152,7 +152,7 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 	case pluginabi.MethodHostModelStreamRead:
 		return h.callHostModelStreamRead(ctx, request)
 	case pluginabi.MethodHostModelStreamClose:
-		return h.callHostModelStreamClose(request)
+		return h.callHostModelStreamClose(ctx, request)
 	case pluginabi.MethodHostHTTPDo:
 		return h.callHostHTTPDo(ctx, request)
 	case pluginabi.MethodHostHTTPDoStream:
@@ -179,8 +179,12 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 		return h.callHostAuthGetRuntime(ctx, request)
 	case pluginabi.MethodHostAuthSave:
 		return h.callHostAuthSave(ctx, request)
+	case pluginabi.MethodHostAuthModels:
+		return h.callHostAuthModels(ctx, request)
 	case pluginabi.MethodHostAffinityLookup:
 		return h.callHostAffinityLookup(ctx, request)
+	case pluginabi.MethodHostRoutingResetCooldown:
+		return h.callHostRoutingResetCooldown(ctx, request)
 	default:
 		return nil, fmt.Errorf("unsupported host callback %s", method)
 	}
@@ -203,7 +207,7 @@ func (h *Host) callHostHTTPDo(ctx context.Context, request []byte) ([]byte, erro
 		return nil, errAcquire
 	}
 	defer operation.finish()
-	resp, errDo := h.newHTTPClient(nil).Do(operation.ctx, httpReq)
+	resp, errDo := h.newHTTPClientWithProxy(nil, oauthProxyURLFromContext(operation.ctx)).Do(operation.ctx, httpReq)
 	if errDo != nil {
 		return nil, errDo
 	}
@@ -236,7 +240,7 @@ func (h *Host) callHostHTTPDoStream(ctx context.Context, request []byte) ([]byte
 		operation.finish()
 	}()
 
-	resp, errDo := h.newHTTPClient(nil).DoStream(streamCtx, httpReq)
+	resp, errDo := h.newHTTPClientWithProxy(nil, oauthProxyURLFromContext(streamCtx)).DoStream(streamCtx, httpReq)
 	if errDo != nil {
 		return nil, errDo
 	}
@@ -384,9 +388,7 @@ func (h *Host) callHostStreamEmit(ctx context.Context, request []byte) ([]byte, 
 		return nil, fmt.Errorf("decode stream emit request: %w", errUnmarshal)
 	}
 	chunk := pluginapi.ExecutorStreamChunk{Payload: append([]byte(nil), req.Payload...)}
-	if req.Error != "" {
-		chunk.Err = fmt.Errorf("%s", req.Error)
-	}
+	chunk.Err = rpcStreamError(req.Error, req.ErrorDetail)
 	if errEmit := h.streams.emit(ctx, req.StreamID, chunk); errEmit != nil {
 		return nil, errEmit
 	}
@@ -398,7 +400,7 @@ func (h *Host) callHostStreamClose(request []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode stream close request: %w", errUnmarshal)
 	}
-	h.streams.close(req.StreamID, req.Error)
+	h.streams.closeWithError(req.StreamID, rpcStreamError(req.Error, req.ErrorDetail))
 	return marshalRPCResult(rpcEmptyResponse{})
 }
 
@@ -445,6 +447,8 @@ func modelExecutionRequestFromPlugin(req pluginapi.HostModelExecutionRequest, sk
 		ForcedProvider:          req.ForcedProvider,
 		AuthID:                  req.AuthID,
 		ProxyURL:                strings.TrimSpace(req.ProxyURL),
+		Path:                    strings.TrimSpace(req.Path),
+		CallerScope:             strings.TrimSpace(req.CallerScope),
 	}
 }
 
