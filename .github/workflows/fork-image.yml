@@ -80,3 +80,18 @@ jobs:
             --tag ghcr.io/iredsc/cli-proxy-api:${{ github.sha }} \
             ghcr.io/iredsc/cli-proxy-api:${{ github.sha }}-amd64 \
             ghcr.io/iredsc/cli-proxy-api:${{ github.sha }}-arm64
+
+  deploy:
+    # Dokploy must not deploy on push: the image does not exist yet then.
+    needs: [manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Dokploy redeploy
+        env:
+          WEBHOOK: ${{ secrets.DOKPLOY_DEPLOY_WEBHOOK }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "::error::DOKPLOY_DEPLOY_WEBHOOK secret is not set; image published but not deployed"
+            exit 1
+          fi
+          curl --fail-with-body -sS -X POST "$WEBHOOK"
